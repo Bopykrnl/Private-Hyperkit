@@ -161,6 +161,13 @@ static UCHAR* gCodeWrite = NULL;
 // ============================================================
 #define MAX_SHADOW_PAGES    8
 #define MAX_SPLIT_PTS       8
+#define MAX_SHADOW_STUBS_PER_PAGE 8
+
+typedef struct _SHADOW_STUB_RANGE {
+    UINT64 StartVa;       // guest virtual address of the first stub byte
+    UINT16 Length;        // bytes that must remain visible on the exec page
+    UINT16 Reserved;
+} SHADOW_STUB_RANGE, * PSHADOW_STUB_RANGE;
 
 typedef struct _SHADOW_PAGE_ENTRY {
     ULONG64  GuestPA;       // 4KB-aligned physical address of the stub page (identity-mapped: guest PA == host PA)
@@ -172,19 +179,21 @@ typedef struct _SHADOW_PAGE_ENTRY {
     PMDL     CaveMdl;       // MDL keeping the cave page resident; prevents MiMappedPageWriter PFN corruption
     BOOLEAN  Active;
     BOOLEAN  InExecState;   // TRUE while exec page is currently mapped
+    ULONG    StubCount;
+    SHADOW_STUB_RANGE Stubs[MAX_SHADOW_STUBS_PER_PAGE];
 } SHADOW_PAGE_ENTRY, * PSHADOW_PAGE_ENTRY;
 
 static SHADOW_PAGE_ENTRY g_ShadowPages[MAX_SHADOW_PAGES];
 static ULONG             g_ShadowPageCount = 0;
 
-// Per-vCPU step state: tracks the shadow entry this CPU activated,
+// Per-VMCB step state: tracks the shadow entry this VpData activated,
 // and the guest's pre-step TF / DR6.BS so SvHandleDb can restore them.
 typedef struct _SHADOW_STEP_STATE {
-    PSHADOW_PAGE_ENTRY ActiveEntry;  // entry swapped to exec on this CPU; NULL when idle
-    bool               GuestHadTf;  // RFLAGS.TF was set by the guest before we armed ours
-    bool               GuestHadBs;  // DR6.BS was set before our step
+    PSHADOW_PAGE_ENTRY ActiveEntry;       // entry swapped to exec by this VMCB; NULL when idle
+    bool               GuestHadTf;       // RFLAGS.TF was set by the guest before we armed ours
+    bool               GuestHadBs;       // DR6.BS was set before our step
+    UINT64             GuestDr6Snapshot; // DR6 captured at NPF time; masks stale hw-BP bits in SvHandleDb
 } SHADOW_STEP_STATE;
-static SHADOW_STEP_STATE g_ShadowStep[MAXIMUM_PROCESSORS];
 
 // Diagnostic counters incremented atomically from VMEXIT context.
 // g_ShadowNpfCount  — #NPF instruction-fetch hits on a guarded page (exec window opened)
@@ -202,6 +211,7 @@ static volatile LONG g_ShadowDbFwdCount = 0;
 #define SHADOW_TRACE_KIND_NPF  1
 #define SHADOW_TRACE_KIND_DB   2
 #define SHADOW_TRACE_KIND_FWD  3
+#define SHADOW_TRACE_KIND_CONT 4
 
 typedef struct _SHADOW_TRACE_ENTRY {
     UINT64 Tsc;
@@ -244,7 +254,8 @@ static void SvDrainShadowTrace(ULONG maxEntries)
         LONG i = (start + n) & (SHADOW_TRACE_ENTRIES - 1);
         SHADOW_TRACE_ENTRY* e = &g_ShadowTrace[i];
         const char* tag = (e->Kind == SHADOW_TRACE_KIND_NPF) ? "NPF" :
-            (e->Kind == SHADOW_TRACE_KIND_DB) ? "DB " : "FWD";
+            (e->Kind == SHADOW_TRACE_KIND_DB) ? "DB " :
+            (e->Kind == SHADOW_TRACE_KIND_CONT) ? "CNT" : "FWD";
         DbgPrint("[shadow-%s] cpu=%u GPA=%016llX DR6=%016llX flags=%02X tsc=%llu\n",
             tag, e->Cpu, e->Gpa, e->Dr6, e->Flags, e->Tsc);
     }
@@ -281,14 +292,53 @@ RegisterNptShadowPage(
     _In_ PVOID  CaveVa,
     _In_ UINT64 TargetFn)
 {
+    PVOID  pageVa = PAGE_ALIGN(CaveVa);
+    ULONG  offset = (ULONG)((ULONG_PTR)CaveVa - (ULONG_PTR)pageVa);
+    PHYSICAL_ADDRESS guestPa = MmGetPhysicalAddress(pageVa);
+    ULONG64 pageGpa = guestPa.QuadPart & ~(ULONG64)0xFFF;
+
+    // Multiple cave stubs frequently live in the same cng/ntoskrnl padding
+    // page.  A guest GPA has exactly one NPT PTE, so it must also have exactly
+    // one exec/decoy pair.  Creating one SHADOW_PAGE_ENTRY per stub makes the
+    // final registration win the PTE while SvFindShadowEntry returns the first
+    // registration, exposing the wrong exec copy at runtime.
+    for (ULONG i = 0; i < g_ShadowPageCount; i++)
+    {
+        PSHADOW_PAGE_ENTRY existing = &g_ShadowPages[i];
+        if (!existing->Active || existing->GuestPA != pageGpa)
+            continue;
+
+        if (TargetFn != 0)
+        {
+            if (existing->StubCount >= MAX_SHADOW_STUBS_PER_PAGE)
+            {
+                DbgPrint("[shadow] Stub range table full for GPA=%llX\n", pageGpa);
+                return FALSE;
+            }
+
+            PUCHAR s = static_cast<PUCHAR>(existing->ExecVA) + offset;
+            s[0] = 0x48; s[1] = 0xB8;
+            *reinterpret_cast<UINT64*>(s + 2) = TargetFn;
+            s[10] = 0xFF; s[11] = 0xE0;
+            s[12] = 0x90; s[13] = 0x90;
+
+            PSHADOW_STUB_RANGE range =
+                &existing->Stubs[existing->StubCount++];
+            range->StartVa = (UINT64)(ULONG_PTR)CaveVa;
+            range->Length = 12; // mov rax,imm64 + jmp rax; trailing NOPs never execute
+            range->Reserved = 0;
+        }
+
+        DbgPrint("[shadow] Coalesced cave=%p into GPA=%llX (%lu stubs)\n",
+            CaveVa, pageGpa, existing->StubCount);
+        return TRUE;
+    }
+
     if (g_ShadowPageCount >= MAX_SHADOW_PAGES)
     {
         DbgPrint("[shadow] Table full, cannot register %p\n", CaveVa);
         return FALSE;
     }
-
-    PVOID  pageVa = PAGE_ALIGN(CaveVa);
-    ULONG  offset = (ULONG)((ULONG_PTR)CaveVa - (ULONG_PTR)pageVa);
 
     // ── 1. Lock the original page for reading only. ───────────────────────
     PMDL mdl = IoAllocateMdl(pageVa, PAGE_SIZE, FALSE, FALSE, nullptr);
@@ -355,7 +405,6 @@ RegisterNptShadowPage(
     }
 
     // ── 4. Record physical addresses. ─────────────────────────────────────
-    PHYSICAL_ADDRESS guestPa = MmGetPhysicalAddress(pageVa);
     PHYSICAL_ADDRESS execPa = MmGetPhysicalAddress(execVa);
     PHYSICAL_ADDRESS decoyPa = MmGetPhysicalAddress(decoyVa);
 
@@ -370,6 +419,14 @@ RegisterNptShadowPage(
     e->Active = TRUE;
     e->NptPte = nullptr;
     e->InExecState = FALSE;
+    e->StubCount = 0;
+    RtlZeroMemory(e->Stubs, sizeof(e->Stubs));
+    if (TargetFn != 0)
+    {
+        e->Stubs[0].StartVa = (UINT64)(ULONG_PTR)CaveVa;
+        e->Stubs[0].Length = 12;
+        e->StubCount = 1;
+    }
 
     DbgPrint("[shadow] %s cave=%p GPA=%llX exec=%llX decoy=%llX\n",
         TargetFn ? "stub" : "stealth",
