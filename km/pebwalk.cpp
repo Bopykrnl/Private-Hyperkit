@@ -1,240 +1,219 @@
-// pebwalk.cpp — included as part of SimpleSvm.cpp single-TU build.
-// Walks a target process's PEB entirely via physical memory reads using
-// translate_linear + read_physical. No KeStackAttachProcess, no virtual
-// address space switch, no AC-visible cross-process callstack.
+// pebwalk.cpp - included as part of the SimpleSvm.cpp single-TU build.
+// Resolves a module base by attaching to the target process and walking the
+// native 64-bit PEB loader list.  No EPROCESS or CR3 offsets are hard coded.
 
-// ============================================================
-//  Minimal physical-read PEB/LDR structures
-//  All pointers stored as uintptr_t (64-bit VA in target process).
-//  We read them physically so we never touch the target address space.
-// ============================================================
+typedef PVOID(NTAPI* PFN_PS_GET_PROCESS_PEB)(
+    _In_ PEPROCESS Process);
 
-// UNICODE_STRING as it appears in 64-bit target process memory
-typedef struct _UNICODE_STRING_T
+typedef struct _SVM_PEB_LDR_DATA64
 {
-    USHORT   Length;
-    USHORT   MaximumLength;
-    UINT32   Pad;
-    UINT64   Buffer;    // VA in target process
-} UNICODE_STRING_T;
+    ULONG Length;
+    BOOLEAN Initialized;
+    UCHAR Padding0[3];
+    PVOID SsHandle;
+    LIST_ENTRY InLoadOrderModuleList;
+    LIST_ENTRY InMemoryOrderModuleList;
+    LIST_ENTRY InInitializationOrderModuleList;
+} SVM_PEB_LDR_DATA64, * PSVM_PEB_LDR_DATA64;
 
-// Minimal LDR_DATA_TABLE_ENTRY fields we actually use
-typedef struct _LDR_ENTRY_T
+typedef struct _SVM_LDR_DATA_TABLE_ENTRY64
 {
-    UINT64 InLoadOrderFlink;    // +0x00  LIST_ENTRY.Flink
-    UINT64 InLoadOrderBlink;    // +0x08
-    UINT64 InMemoryOrderFlink;  // +0x10
-    UINT64 InMemoryOrderBlink;  // +0x18
-    UINT64 InInitOrderFlink;    // +0x20
-    UINT64 InInitOrderBlink;    // +0x28
-    UINT64 DllBase;             // +0x30
-    UINT64 EntryPoint;          // +0x38
-    UINT64 SizeOfImage;         // +0x40  (stored as ULONG but padded to 8)
-    UNICODE_STRING_T FullDllName;   // +0x48
-    UNICODE_STRING_T BaseDllName;   // +0x58
-} LDR_ENTRY_T;
+    LIST_ENTRY InLoadOrderLinks;
+    LIST_ENTRY InMemoryOrderLinks;
+    LIST_ENTRY InInitializationOrderLinks;
+    PVOID DllBase;
+    PVOID EntryPoint;
+    ULONG SizeOfImage;
+    ULONG Padding0;
+    UNICODE_STRING FullDllName;
+    UNICODE_STRING BaseDllName;
+} SVM_LDR_DATA_TABLE_ENTRY64, * PSVM_LDR_DATA_TABLE_ENTRY64;
 
-// Minimal PEB_LDR_DATA fields
-typedef struct _PEB_LDR_T
+typedef struct _SVM_PEB64
 {
-    UINT32 Length;              // +0x00
-    UINT32 Initialized;         // +0x04
-    UINT64 SsHandle;            // +0x08
-    UINT64 InLoadOrderFlink;    // +0x10  InLoadOrderModuleList.Flink
-    UINT64 InLoadOrderBlink;    // +0x18
-} PEB_LDR_T;
+    UCHAR InheritedAddressSpace;
+    UCHAR ReadImageFileExecOptions;
+    UCHAR BeingDebugged;
+    UCHAR BitField;
+    ULONG Padding0;
+    PVOID Mutant;
+    PVOID ImageBaseAddress;
+    PSVM_PEB_LDR_DATA64 Ldr;
+} SVM_PEB64, * PSVM_PEB64;
 
-// Minimal PEB fields (64-bit)
-typedef struct _PEB_T
+static_assert(FIELD_OFFSET(SVM_PEB64, Ldr) == 0x18,
+    "Unexpected native PEB.Ldr layout");
+static_assert(FIELD_OFFSET(SVM_PEB_LDR_DATA64, InMemoryOrderModuleList) == 0x20,
+    "Unexpected native PEB_LDR_DATA layout");
+static_assert(FIELD_OFFSET(SVM_LDR_DATA_TABLE_ENTRY64, InMemoryOrderLinks) == 0x10,
+    "Unexpected native LDR_DATA_TABLE_ENTRY layout");
+static_assert(FIELD_OFFSET(SVM_LDR_DATA_TABLE_ENTRY64, DllBase) == 0x30,
+    "Unexpected native LDR_DATA_TABLE_ENTRY.DllBase layout");
+
+// The UNICODE_STRING descriptor is copied to kernel stack before this helper is
+// called.  Only Buffer points into the attached process.
+static BOOLEAN SvCopyAttachedUnicodeString(
+    _In_ const UNICODE_STRING* Source,
+    _Out_writes_(DestinationChars) WCHAR* Destination,
+    _In_ SIZE_T DestinationChars)
 {
-    UINT8  InheritedAddressSpace;   // +0x000
-    UINT8  ReadImageFileExecOptions;// +0x001
-    UINT8  BeingDebugged;           // +0x002
-    UINT8  BitField;                // +0x003
-    UINT32 Pad;                     // +0x004
-    UINT64 Mutant;                  // +0x008
-    UINT64 ImageBaseAddress;        // +0x010
-    UINT64 Ldr;                     // +0x018  → PEB_LDR_DATA VA in target
-} _PEB_T;
+    if (!Source || !Destination || DestinationChars == 0)
+        return FALSE;
 
-// ----------------------------------------------------------------
-//  PhysReadT<T> — read sizeof(T) bytes from a target-process VA
-//  using the target's DTB for translation.
-// ----------------------------------------------------------------
-template<typename T>
-static T PhysReadVA(uintptr_t targetDtb, uintptr_t va)
-{
-    T val = {};
-    if (!va) return val;
+    Destination[0] = L'\0';
 
-    uintptr_t pa = request::translate_linear(targetDtb, va);
-    if (!pa) return val;
-
-    size_t bytes = 0;
-    request::read_physical(pa, &val, sizeof(T), &bytes);
-    return val;
-}
-
-// Read a UNICODE_STRING_T's content (up to maxChars wide chars) into buf.
-static BOOLEAN PhysReadUnicodeString(
-    uintptr_t targetDtb,
-    const UNICODE_STRING_T& us,
-    WCHAR* buf, SIZE_T maxChars)
-{
-    if (!us.Buffer || !us.Length) return FALSE;
-    SIZE_T charCount = us.Length / sizeof(WCHAR);
-    if (charCount >= maxChars) charCount = maxChars - 1;
-
-    // The string may span a page boundary — read byte by byte in page chunks
-    SIZE_T remaining = charCount * sizeof(WCHAR);
-    uintptr_t srcVA  = (uintptr_t)us.Buffer;
-    PUCHAR    dst    = (PUCHAR)buf;
-
-    while (remaining > 0)
+    if (!Source->Buffer || Source->Length == 0 ||
+        (Source->Length & (sizeof(WCHAR) - 1)) != 0 ||
+        Source->Length > Source->MaximumLength)
     {
-        uintptr_t pa = request::translate_linear(targetDtb, srcVA);
-        if (!pa) return FALSE;
-
-        SIZE_T chunk = PAGE_SIZE - (pa & 0xFFF);
-        if (chunk > remaining) chunk = remaining;
-
-        size_t got = 0;
-        if (!NT_SUCCESS(request::read_physical(pa, dst, chunk, &got))) return FALSE;
-
-        dst       += chunk;
-        srcVA     += chunk;
-        remaining -= chunk;
+        return FALSE;
     }
 
-    buf[charCount] = L'\0';
-    return TRUE;
-}
+    SIZE_T chars = Source->Length / sizeof(WCHAR);
+    if (chars >= DestinationChars)
+        chars = DestinationChars - 1;
 
-// ----------------------------------------------------------------
-//  GetProcessModuleBase — physical PEB walk, no address space switch
-//
-//  targetDtb must already be resolved (e.g. from get_dtb IOCTL).
-//  Returns the DllBase VA in the target process, or 0 on failure.
-// ----------------------------------------------------------------
-static uintptr_t GetProcessModuleBase(uintptr_t targetDtb, const WCHAR* moduleName)
-{
-    if (!targetDtb || !moduleName) return 0;
-
-    // Copy the module name to kernel stack before any physical reads
-    WCHAR nameBuffer[128] = {};
-    __try {
-        wcsncpy(nameBuffer, moduleName, 127);
-        nameBuffer[127] = L'\0';
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
-
-    // Read PEB address from EPROCESS — PsGetProcessPeb returns a VA valid
-    // in the target's address space. We translate it physically instead.
-    // EPROCESS.Peb is at +0x550 on Win10/11 x64 (consistent across builds).
-    // We receive the EPROCESS pointer from the caller; locate it via physical.
-    // Simpler: accept the PEB VA directly as a parameter derived from EPROCESS.
-    // Callers should use GetProcessPebVA() below to obtain it.
-    return 0;   // see GetProcessModuleBaseFromPeb below
-}
-
-// Resolve the target process's PEB VA from the EPROCESS kernel object.
-// EPROCESS.Peb is at +0x550 on Win10/11 x64. The EPROCESS object lives in
-// non-paged pool so MmGetPhysicalAddress is safe; no attachment needed.
-static uintptr_t GetProcessPebVA(PEPROCESS process)
-{
-    if (!process) return 0;
-
-    // Read EPROCESS.Peb (pointer-sized field at +0x550) via physical mapping
-    // of the kernel object — identical pattern to how get_dtb reads the DTB.
-    PVOID pebFieldVA  = (PVOID)((ULONG_PTR)process + 0x550);
-    PHYSICAL_ADDRESS pebFieldPA  = MmGetPhysicalAddress(pebFieldVA);
-    PVOID pebFieldKVA = MmGetVirtualForPhysical(pebFieldPA);
-    if (!pebFieldKVA) return 0;
-    return *(uintptr_t*)pebFieldKVA;
-}
-
-// ----------------------------------------------------------------
-//  GetProcessModuleBaseFromPeb — the real implementation
-//
-//  pebVA  = target process PEB virtual address (from GetProcessPebVA)
-//  dtb    = target process CR3 / directory table base
-// ----------------------------------------------------------------
-static uintptr_t GetProcessModuleBaseFromPeb(
-    uintptr_t pebVA,
-    uintptr_t dtb,
-    const WCHAR* moduleName)
-{
-    if (!pebVA || !dtb || !moduleName) return 0;
-
-    // Copy module name to stack
-    WCHAR nameBuffer[128] = {};
-    __try {
-        wcsncpy(nameBuffer, moduleName, 127);
-        nameBuffer[127] = L'\0';
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
-
-    // Read PEB.Ldr VA
-    _PEB_T peb = PhysReadVA<_PEB_T>(dtb, pebVA);
-    if (!peb.Ldr) return 0;
-
-    // Read PEB_LDR_DATA
-    PEB_LDR_T ldr = PhysReadVA<PEB_LDR_T>(dtb, peb.Ldr);
-    if (!ldr.InLoadOrderFlink) return 0;
-
-    // The InLoadOrderModuleList head is at PEB_LDR_DATA + 0x10
-    uintptr_t listHeadVA = peb.Ldr + offsetof(PEB_LDR_T, InLoadOrderFlink);
-    uintptr_t entryVA    = ldr.InLoadOrderFlink;
-
-    ULONG guard = 0;
-    while (entryVA && entryVA != listHeadVA && guard++ < 512)
+    const SIZE_T bytes = chars * sizeof(WCHAR);
+    __try
     {
-        // LDR_DATA_TABLE_ENTRY.InLoadOrderLinks is the first field,
-        // so entryVA IS the base of the LDR_ENTRY_T struct.
-        LDR_ENTRY_T entry = PhysReadVA<LDR_ENTRY_T>(dtb, entryVA);
-
-        if (entry.BaseDllName.Buffer && entry.BaseDllName.Length)
-        {
-            WCHAR dllName[128] = {};
-            if (PhysReadUnicodeString(dtb, entry.BaseDllName, dllName, 128))
-            {
-                if (_wcsicmp(dllName, nameBuffer) == 0)
-                    return (uintptr_t)entry.DllBase;
-            }
-        }
-
-        entryVA = entry.InLoadOrderFlink;
+        ProbeForRead(Source->Buffer, bytes, sizeof(WCHAR));
+        RtlCopyMemory(Destination, Source->Buffer, bytes);
+        Destination[chars] = L'\0';
+        return TRUE;
     }
-
-    return 0;
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        Destination[0] = L'\0';
+        return FALSE;
+    }
 }
 
-// ----------------------------------------------------------------
-//  Public entry point — given a PID and module name, returns the
-//  DllBase VA in that process. Zero on failure.
-// ----------------------------------------------------------------
+static PFN_PS_GET_PROCESS_PEB SvResolvePsGetProcessPeb(VOID)
+{
+    UNICODE_STRING routineName = RTL_CONSTANT_STRING(L"PsGetProcessPeb");
+    return reinterpret_cast<PFN_PS_GET_PROCESS_PEB>(
+        MmGetSystemRoutineAddress(&routineName));
+}
+
+// Public entry point used by request::get_module_base.  The IOCTL ABI remains
+// unchanged: return the requested module's DllBase, or zero on failure.
 static uintptr_t GetModuleBaseByPid(HANDLE pid, const WCHAR* moduleName)
 {
-    PEPROCESS process = NULL;
-    if (!NT_SUCCESS(PsLookupProcessByProcessId(pid, &process)))
+    if (!pid || !moduleName || KeGetCurrentIrql() != PASSIVE_LEVEL)
         return 0;
 
-    uintptr_t pebVA = GetProcessPebVA(process);
-
-    // Get the physical DTB for this process via the same physical mapping
-    // used by get_dtb: read EPROCESS.DirectoryTableBase at +0x28
-    uintptr_t dtb = 0;
+    WCHAR requestedName[128] = {};
+    __try
     {
-        PVOID dtbFieldVA = (PVOID)((ULONG_PTR)process + 0x28);
-        PHYSICAL_ADDRESS dtbFieldPA = MmGetPhysicalAddress(dtbFieldVA);
-        PVOID dtbFieldKVA = MmGetVirtualForPhysical(dtbFieldPA);
-        if (dtbFieldKVA)
-            dtb = *(uintptr_t*)dtbFieldKVA & ~(uintptr_t)0xFFF;
+        wcsncpy(requestedName, moduleName, RTL_NUMBER_OF(requestedName) - 1);
+        requestedName[RTL_NUMBER_OF(requestedName) - 1] = L'\0';
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return 0;
     }
 
-    ObDereferenceObject(process);
+    if (requestedName[0] == L'\0')
+        return 0;
 
-    if (!dtb || !pebVA) return 0;
+    PFN_PS_GET_PROCESS_PEB getProcessPeb = SvResolvePsGetProcessPeb();
+    if (!getProcessPeb)
+        return 0;
 
-    return GetProcessModuleBaseFromPeb(pebVA, dtb, moduleName);
+    PEPROCESS process = nullptr;
+    if (!NT_SUCCESS(PsLookupProcessByProcessId(pid, &process)) || !process)
+        return 0;
+
+    uintptr_t result = 0;
+    KAPC_STATE apcState = {};
+    BOOLEAN attached = FALSE;
+
+    __try
+    {
+        PSVM_PEB64 peb = static_cast<PSVM_PEB64>(getProcessPeb(process));
+        if (!peb)
+            __leave;
+
+        KeStackAttachProcess(reinterpret_cast<PRKPROCESS>(process), &apcState);
+        attached = TRUE;
+
+        PSVM_PEB_LDR_DATA64 ldr = nullptr;
+        __try
+        {
+            ProbeForRead(peb, sizeof(*peb), __alignof(SVM_PEB64));
+            ldr = peb->Ldr;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            ldr = nullptr;
+        }
+
+        if (!ldr)
+            __leave;
+
+        LIST_ENTRY* head = &ldr->InMemoryOrderModuleList;
+        LIST_ENTRY* link = nullptr;
+        __try
+        {
+            ProbeForRead(ldr, sizeof(*ldr), __alignof(SVM_PEB_LDR_DATA64));
+            if (!ldr->Initialized)
+                __leave;
+            link = head->Flink;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            link = nullptr;
+        }
+
+        for (ULONG iteration = 0;
+             link && link != head && iteration < 1024;
+             iteration++)
+        {
+            PSVM_LDR_DATA_TABLE_ENTRY64 userEntry = CONTAINING_RECORD(
+                link,
+                SVM_LDR_DATA_TABLE_ENTRY64,
+                InMemoryOrderLinks);
+
+            SVM_LDR_DATA_TABLE_ENTRY64 entry = {};
+            __try
+            {
+                ProbeForRead(userEntry, sizeof(*userEntry),
+                    __alignof(SVM_LDR_DATA_TABLE_ENTRY64));
+                RtlCopyMemory(&entry, userEntry, sizeof(entry));
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+                break;
+            }
+
+            // Save the next link before touching the name buffer.  The loader
+            // list is user-owned and may change while it is being inspected.
+            link = entry.InMemoryOrderLinks.Flink;
+
+            if (!entry.DllBase || entry.SizeOfImage == 0 ||
+                entry.SizeOfImage >= 0x50000000UL)
+            {
+                continue;
+            }
+
+            WCHAR currentName[128] = {};
+            if (SvCopyAttachedUnicodeString(
+                    &entry.BaseDllName,
+                    currentName,
+                    RTL_NUMBER_OF(currentName)) &&
+                _wcsicmp(currentName, requestedName) == 0)
+            {
+                result = reinterpret_cast<uintptr_t>(entry.DllBase);
+                break;
+            }
+        }
+    }
+    __finally
+    {
+        if (attached)
+            KeUnstackDetachProcess(&apcState);
+        ObDereferenceObject(process);
+    }
+
+    return result;
 }
