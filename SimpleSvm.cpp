@@ -316,7 +316,7 @@ typedef struct _VIRTUAL_PROCESSOR_DATA
             UINT64 HostVmcbPa;
             struct _VIRTUAL_PROCESSOR_DATA* Self;
             PSHARED_VIRTUAL_PROCESSOR_DATA SharedVpData;
-            UINT64 Padding1;        // To keep HostRsp 16 bytes aligned
+            SHADOW_STEP_STATE* ShadowStepState; // VMCB-owned state; preserves the existing 8-byte layout slot
             UINT64 Reserved1;
         } HostStackLayout;
     };
@@ -369,6 +369,11 @@ typedef struct _GUEST_CONTEXT
 #define CPUID_FN8000_0001_ECX_SVM                   (1UL << 2)
 #define CPUID_FN0000_0001_ECX_HYPERVISOR_PRESENT    (1UL << 31)
 #define CPUID_FN8000_000A_EDX_NP                    (1UL << 0)
+#define CPUID_FN8000_000A_EDX_FLUSH_BY_ASID         (1UL << 6)
+
+// CPUID Fn8000_000A:EDX[6].  TLB_CONTROL=3 is legal only when this feature
+// is exposed.  Nested VMware commonly exposes NPT but not FlushByAsid.
+static BOOLEAN g_SvmFlushByAsidSupported = FALSE;
 
 #define CPUID_MAX_STANDARD_FN_NUMBER_AND_VENDOR_STRING          0x00000000
 #define CPUID_PROCESSOR_AND_PROCESSOR_FEATURE_IDENTIFIERS       0x00000001
@@ -566,6 +571,53 @@ static VOID SvDestroyHostCr3(VOID)
 }
 
 // ---------------------------------------------------------------------------
+// Host-side IDT / TSS for catching double-faults before they escalate.
+// The IST1 stack for vector 8 (#DF) breaks the recursive stack chain.
+//
+// NOTE: This block must appear BEFORE SvBuildHostGdt, which references
+// TSS_64 / g_HostTss / g_HostDfStack when building the private per-CPU TSS
+// descriptor.
+// ---------------------------------------------------------------------------
+#pragma pack(push, 1)
+typedef struct _IDT_ENTRY_64
+{
+    UINT16 OffsetLow;       // [0:15]
+    UINT16 Selector;        // [16:31]
+    UINT8  Ist;             // [32:39]
+    UINT8  Attributes;      // [40:47]
+    UINT16 OffsetMiddle;    // [48:63]
+    UINT32 OffsetHigh;      // [64:95]
+    UINT32 Reserved;        // [96:127]
+} IDT_ENTRY_64, * PIDT_ENTRY_64;
+static_assert(sizeof(IDT_ENTRY_64) == 16, "IDT_ENTRY_64 Size Mismatch");
+
+typedef struct _TSS_64
+{
+    UINT32 Reserved0;
+    UINT64 Rsp0;
+    UINT64 Rsp1;
+    UINT64 Rsp2;
+    UINT64 Reserved1;
+    UINT64 Ist1;
+    UINT64 Ist2;
+    UINT64 Ist3;
+    UINT64 Ist4;
+    UINT64 Ist5;
+    UINT64 Ist6;
+    UINT64 Ist7;
+    UINT64 Reserved2;
+    UINT16 Reserved3;
+    UINT16 IoMapBaseAddress;
+} TSS_64, * PTSS_64;
+static_assert(sizeof(TSS_64) == 104, "TSS_64 Size Mismatch");
+#pragma pack(pop)
+
+static DECLSPEC_ALIGN(16) IDT_ENTRY_64 g_HostIdt[256];
+static DECLSPEC_ALIGN(16) TSS_64       g_HostTss[256];  // per-CPU (max 256 CPUs)
+static DECLSPEC_ALIGN(16) UINT8        g_HostDfStack[256][0x4000];  // per-CPU IST1 stacks
+static BOOLEAN                         g_HostIdtInitialized = FALSE;
+
+// ---------------------------------------------------------------------------
 // Private host GDT — per-CPU copy of the current GDT loaded before VMRUN.
 // VMRUN captures GDTR into the HSAVE area, so loading our private GDT before
 // VMRUN means host-mode always runs with an isolated descriptor table.
@@ -612,6 +664,59 @@ static BOOLEAN SvBuildHostGdt(_In_ ULONG CpuIndex)
     {
         PUINT8 trDesc = (PUINT8)copy + (tr & ~7U);
         trDesc[5] &= ~(UINT8)0x02;   // clear the busy bit (bit 1 of access byte)
+
+        //
+        // CRITICAL: repoint this descriptor at OUR OWN private TSS
+        // (g_HostTss[CpuIndex]), not the system's real TSS.
+        //
+        // The byte-copy above duplicated the GDT, but the TSS descriptor it
+        // copied still encodes the BASE ADDRESS of the real, live Windows TSS
+        // (TR pointed at it when we read it). Loading TR from this "private"
+        // GDT with that descriptor unmodified means LTR still resolves to the
+        // SAME system TSS object in memory — there is no private TSS in play.
+        //
+        // A previous version of this code "solved" the need for a private
+        // IST1 stack by writing directly into that live system TSS's Ist1
+        // field. That is a permanent, unrestored modification of real kernel
+        // data that Windows (and PatchGuard) consider critical — caught as
+        // CRITICAL_STRUCTURE_CORRUPTION (0x109) with a "generic data region"
+        // failure type. It also affects EVERY exception on that CPU that uses
+        // IST1, not just ours, for the remaining lifetime of the boot.
+        //
+        // Fix: rewrite the base-address fields of this descriptor (in OUR
+        // copy only — the real GDT and real TSS are untouched) to point at
+        // g_HostTss[CpuIndex] instead. LTR then loads a TR that resolves to
+        // our own private TSS. We set up Ist1 on that private TSS below.
+        //
+        // 16-byte system descriptor base-address field layout (Intel/AMD):
+        //   byte copy[0..1]   = SegmentLimit[0:15]      (unused here)
+        //   byte copy[2..3]   = BaseAddress[0:15]
+        //   byte copy[4]      = BaseAddress[16:23]
+        //   byte copy[5]      = Access / Type byte (already patched above)
+        //   byte copy[6]      = Limit[16:19] | Flags
+        //   byte copy[7]      = BaseAddress[24:31]
+        //   qword copy[8..15] = BaseAddress[32:63] (high 32 bits, low 32 of
+        //                       that qword) + reserved
+        //
+        RtlZeroMemory(&g_HostTss[CpuIndex], sizeof(g_HostTss[CpuIndex]));
+        g_HostTss[CpuIndex].Ist1 =
+            (UINT64)&g_HostDfStack[CpuIndex][sizeof(g_HostDfStack[CpuIndex]) - 0x10];
+
+        UINT64 tssBase = (UINT64)&g_HostTss[CpuIndex];
+        trDesc[2] = (UINT8)(tssBase & 0xFF);
+        trDesc[3] = (UINT8)((tssBase >> 8) & 0xFF);
+        trDesc[4] = (UINT8)((tssBase >> 16) & 0xFF);
+        trDesc[7] = (UINT8)((tssBase >> 24) & 0xFF);
+        *(UINT32*)(trDesc + 8) = (UINT32)(tssBase >> 32);
+        *(UINT32*)(trDesc + 12) = 0;   // reserved, must be zero
+        // trDesc[12..15] (upper half of the high qword) stay zero (reserved).
+
+        // Limit must cover our TSS_64 (104 bytes) — set to sizeof-1, low
+        // 16 bits in copy[0..1], top nibble of limit in low nibble of copy[6].
+        UINT32 tssLimit = (UINT32)sizeof(TSS_64) - 1;
+        trDesc[0] = (UINT8)(tssLimit & 0xFF);
+        trDesc[1] = (UINT8)((tssLimit >> 8) & 0xFF);
+        trDesc[6] = (UINT8)((trDesc[6] & 0xF0) | ((tssLimit >> 16) & 0x0F));
     }
 
     g_HostGdt[CpuIndex] = copy;
@@ -631,50 +736,7 @@ static VOID SvDestroyHostGdt(_In_ ULONG CpuIndex)
     }
 }
 
-//
-// Host-side IDT / TSS for catching double-faults before they escalate.
-// The IST1 stack for vector 8 (#DF) breaks the recursive stack chain.
-//
-#pragma pack(push, 1)
-typedef struct _IDT_ENTRY_64
-{
-    UINT16 OffsetLow;       // [0:15]
-    UINT16 Selector;        // [16:31]
-    UINT8  Ist;             // [32:39]
-    UINT8  Attributes;      // [40:47]
-    UINT16 OffsetMiddle;    // [48:63]
-    UINT32 OffsetHigh;      // [64:95]
-    UINT32 Reserved;        // [96:127]
-} IDT_ENTRY_64, * PIDT_ENTRY_64;
-static_assert(sizeof(IDT_ENTRY_64) == 16, "IDT_ENTRY_64 Size Mismatch");
 
-typedef struct _TSS_64
-{
-    UINT32 Reserved0;
-    UINT64 Rsp0;
-    UINT64 Rsp1;
-    UINT64 Rsp2;
-    UINT64 Reserved1;
-    UINT64 Ist1;
-    UINT64 Ist2;
-    UINT64 Ist3;
-    UINT64 Ist4;
-    UINT64 Ist5;
-    UINT64 Ist6;
-    UINT64 Ist7;
-    UINT64 Reserved2;
-    UINT16 Reserved3;
-    UINT16 IoMapBaseAddress;
-} TSS_64, * PTSS_64;
-static_assert(sizeof(TSS_64) == 104, "TSS_64 Size Mismatch");
-#pragma pack(pop)
-
-static DECLSPEC_ALIGN(16) IDT_ENTRY_64 g_HostIdt[256];
-static DECLSPEC_ALIGN(16) TSS_64       g_HostTss[256];  // per-CPU (max 256 CPUs)
-static DECLSPEC_ALIGN(16) UINT8        g_HostDfStack[256][0x4000];  // per-CPU IST1 stacks
-static BOOLEAN                         g_HostIdtInitialized = FALSE;
-
-// Pre-allocated overflow PML4E_TREEs for GPAs above NPT_PML4_COUNT*512GB.
 // Each slot covers one 512GB PML4 entry that was not pre-built.
 // Wired into Pml4Entries on-demand from SvHandleNpf (no allocation at VMEXIT time).
 #define NPT_OVERFLOW_SLOTS 8
@@ -3297,8 +3359,10 @@ SvVirtualizeProcessor(
     PSHARED_VIRTUAL_PROCESSOR_DATA sharedVpData;
     PVIRTUAL_PROCESSOR_DATA vpData;
     PCONTEXT contextRecord;
+    SHADOW_STEP_STATE* shadowStepState;
 
     vpData = nullptr;
+    shadowStepState = nullptr;
 
     NT_ASSERT(ARGUMENT_PRESENT(Context));
     _Analysis_assume_(ARGUMENT_PRESENT(Context));
@@ -3326,6 +3390,19 @@ SvVirtualizeProcessor(
         status = STATUS_INSUFFICIENT_RESOURCES;
         goto Exit;
     }
+
+    shadowStepState = static_cast<SHADOW_STEP_STATE*>(ExAllocatePool2(
+        POOL_FLAG_NON_PAGED,
+        sizeof(*shadowStepState),
+        'tSVS'));
+    if (shadowStepState == nullptr)
+    {
+        SvDebugPrint("Insufficient memory for shadow-step state.\n");
+        status = STATUS_INSUFFICIENT_RESOURCES;
+        goto Exit;
+    }
+    RtlZeroMemory(shadowStepState, sizeof(*shadowStepState));
+    vpData->HostStackLayout.ShadowStepState = shadowStepState;
 
     //
     // Capture the current RIP, RSP, RFLAGS, and segment selectors. This
@@ -3392,7 +3469,7 @@ SvVirtualizeProcessor(
             vpData->HostStackLayout.GuestVmcbPa,
             vpData->HostStackLayout.HostVmcbPa);
 
-        DESCRIPTOR_TABLE_REGISTER hostIdtr, gdtr;
+        DESCRIPTOR_TABLE_REGISTER hostIdtr;
         UINT16 csSelector;
         ULONG cpu = KeGetCurrentProcessorIndex();
 
@@ -3463,17 +3540,11 @@ SvVirtualizeProcessor(
         // ----------------------------------------------------------------
         _disable();
 
-        // Patch the system TSS Ist1 so our #DF handler has a dedicated stack.
-        {
-            UINT16 tr = SvReadTr();
-            _sgdt(&gdtr);
-            UINT64* gdte = (UINT64*)((UINT8*)gdtr.Base + (tr & ~7));
-            ULONG_PTR tssBase = ((gdte[0] >> 16) & 0xFFFFFF) |
-                ((gdte[0] >> 32) & 0xFF000000) |
-                (gdte[1] << 32);
-            PTSS_64 sysTss = (PTSS_64)tssBase;
-            sysTss->Ist1 = (UINT64)&g_HostDfStack[cpu][sizeof(g_HostDfStack[cpu]) - 0x10];
-        }
+        // NOTE: We no longer patch the live system TSS here. Our private GDT's
+        // TSS descriptor (built in SvBuildHostGdt) now points at our own
+        // g_HostTss[cpu], which already has Ist1 set up for us. The real
+        // Windows TSS is never modified — see SvBuildHostGdt for why directly
+        // patching it caused CRITICAL_STRUCTURE_CORRUPTION (0x109).
 
         // Save the original IDTR — must be restored on teardown because VMRUN
         // captures IDTR into HSAVE and every VMEXIT restores our private IDT.
@@ -3534,6 +3605,11 @@ Exit:
         // Frees per processor data if allocated and this function is
         // unsuccessful.
         //
+        if (shadowStepState != nullptr)
+        {
+            ExFreePoolWithTag(shadowStepState, 'tSVS');
+            vpData->HostStackLayout.ShadowStepState = nullptr;
+        }
         SvFreePageAlingedPhysicalMemory(vpData);
     }
     return status;
@@ -3697,6 +3773,11 @@ SvDevirtualizeProcessor(
     //
     sharedVpDataPtr = static_cast<PSHARED_VIRTUAL_PROCESSOR_DATA*>(Context);
     *sharedVpDataPtr = vpData->HostStackLayout.SharedVpData;
+    if (vpData->HostStackLayout.ShadowStepState != nullptr)
+    {
+        ExFreePoolWithTag(vpData->HostStackLayout.ShadowStepState, 'tSVS');
+        vpData->HostStackLayout.ShadowStepState = nullptr;
+    }
     SvFreePageAlingedPhysicalMemory(vpData);
 
 Exit:
@@ -3792,6 +3873,16 @@ typedef struct _PT_ENTRY_4KB
     };
 } PT_ENTRY_4KB, * PPT_ENTRY_4KB;
 static_assert(sizeof(PT_ENTRY_4KB) == 8, "PT_ENTRY_4KB size");
+
+static FORCEINLINE VOID SvRequestGuestTlbFlush(
+    _Inout_ PVIRTUAL_PROCESSOR_DATA VpData)
+{
+    // 1 = flush all guest TLB entries (architectural baseline)
+    // 3 = flush entries for this VMCB's ASID (requires FlushByAsid)
+    VpData->GuestVmcb.ControlArea.TlbControl =
+        g_SvmFlushByAsidSupported ? 3u : 1u;
+    VpData->GuestVmcb.ControlArea.VmcbClean = 0;
+}
 
 // Split the 2MB NPT PDE that covers GuestPA into 512 4KB PTEs.
 // Returns a pointer to the specific 4KB PTE for GuestPA, or NULL on failure.
@@ -3957,7 +4048,7 @@ static VOID SvHandleNpf(
                 pde->Fields.Write = 1;
                 pde->Fields.User = 1;
                 pde->Fields.LargePage = 1;
-                VpData->GuestVmcb.ControlArea.TlbControl = 3;
+                SvRequestGuestTlbFlush(VpData);
             }
             else if (!pde->Fields.LargePage)
             {
@@ -3983,19 +4074,19 @@ static VOID SvHandleNpf(
                         {
                             // Collateral non-shadow PTE with Write=0 — restore write permission.
                             pt[pteIdx].Fields.Write = 1;
-                            VpData->GuestVmcb.ControlArea.TlbControl = 3;
+                            SvRequestGuestTlbFlush(VpData);
                         }
                         else
                         {
                             // Write to a shadow-protected page. Swap to exec so the write
                             // lands on the real backing physical page, then single-step to
                             // restore decoy. Same flow as instruction-fetch NPF.
-                            ULONG cpu = KeGetCurrentProcessorIndex();
-                            SHADOW_STEP_STATE* s = &g_ShadowStep[cpu];
+                            SHADOW_STEP_STATE* s = VpData->HostStackLayout.ShadowStepState;
 
                             s->ActiveEntry = e;
                             s->GuestHadTf = (VpData->GuestVmcb.StateSaveArea.Rflags & 0x100) != 0;
                             s->GuestHadBs = (VpData->GuestVmcb.StateSaveArea.Dr6 & (1ULL << 14)) != 0;
+                            s->GuestDr6Snapshot = VpData->GuestVmcb.StateSaveArea.Dr6;
 
                             // Point PTE at exec page, Write=1 so write completes, NX=0.
                             PPT_ENTRY_4KB shadowPte = (PPT_ENTRY_4KB)(ULONG_PTR)e->NptPte;
@@ -4008,7 +4099,7 @@ static VOID SvHandleNpf(
                             SvShadowTrace(SHADOW_TRACE_KIND_NPF, faultGPA, 0, 1);
 
                             VpData->GuestVmcb.StateSaveArea.Rflags |= 0x100;   // arm TF
-                            VpData->GuestVmcb.ControlArea.TlbControl = 3;
+                            SvRequestGuestTlbFlush(VpData);
                             // RIP NOT advanced — guest re-executes write against exec page.
                         }
                     }
@@ -4058,7 +4149,7 @@ static VOID SvHandleNpf(
                     pde2->Fields.User = 1;
                     pde2->Fields.LargePage = 1;
                 }
-                VpData->GuestVmcb.ControlArea.TlbControl = 3;
+                SvRequestGuestTlbFlush(VpData);
             }
             // If no overflow slots remain, the NPF re-fires. Nothing safe to do
             // without allocation — the guest will get stuck on this GPA.
@@ -4070,13 +4161,13 @@ static VOID SvHandleNpf(
     if (!e || !e->NptPte)
         return;
 
-    ULONG cpu = KeGetCurrentProcessorIndex();
-    SHADOW_STEP_STATE* s = &g_ShadowStep[cpu];
+    SHADOW_STEP_STATE* s = VpData->HostStackLayout.ShadowStepState;
 
     // Snapshot guest state before we perturb anything so SvHandleDb can restore it.
     s->ActiveEntry = e;
     s->GuestHadTf = (VpData->GuestVmcb.StateSaveArea.Rflags & 0x100) != 0;
     s->GuestHadBs = (VpData->GuestVmcb.StateSaveArea.Dr6 & (1ULL << 14)) != 0;
+    s->GuestDr6Snapshot = VpData->GuestVmcb.StateSaveArea.Dr6;
 
     // Swap to exec page: point PTE at ExecPA, clear NX.
     PPT_ENTRY_4KB pte = (PPT_ENTRY_4KB)(ULONG_PTR)e->NptPte;
@@ -4092,11 +4183,44 @@ static VOID SvHandleNpf(
     VpData->GuestVmcb.StateSaveArea.Rflags |= 0x100;   // RFLAGS.TF
 
     // Flush guest TLB for this ASID so the updated PTE takes effect immediately.
-    VpData->GuestVmcb.ControlArea.TlbControl = 3;
+    SvRequestGuestTlbFlush(VpData);
 
     // Do NOT advance RIP — the guest must re-execute the faulting instruction
     // now that the PTE points at the exec page.
 #endif
+}
+
+// SvHandleVmexit preserves an interrupted guest event by copying ExitIntInfo
+// into EventInj before dispatching the exit-specific handler.  On some AMD
+// systems an intercepted #DB is reported there as well.  A shadow-step #DB is
+// consumed by SvHandleDb, so leaving that pre-populated event intact delivers a
+// second, guest-visible #DB at the resume RIP.
+static FORCEINLINE VOID SvDiscardQueuedDb(
+    _Inout_ PVIRTUAL_PROCESSOR_DATA VpData)
+{
+    EVENTINJ queued;
+    queued.AsUInt64 = VpData->GuestVmcb.ControlArea.EventInj;
+
+    if (queued.Fields.Valid &&
+        queued.Fields.Type == 3 &&
+        queued.Fields.Vector == 1)
+    {
+        VpData->GuestVmcb.ControlArea.EventInj = 0;
+    }
+}
+
+static FORCEINLINE BOOLEAN SvRipIsInsideShadowStub(
+    _In_ const SHADOW_PAGE_ENTRY* Entry,
+    _In_ UINT64 Rip)
+{
+    for (ULONG i = 0; i < Entry->StubCount; i++)
+    {
+        const UINT64 start = Entry->Stubs[i].StartVa;
+        const UINT64 end = start + Entry->Stubs[i].Length;
+        if (end >= start && Rip >= start && Rip < end)
+            return TRUE;
+    }
+    return FALSE;
 }
 
 // #DB handler: single-step fired after one instruction executed on the exec page.
@@ -4105,40 +4229,140 @@ static VOID SvHandleNpf(
 static VOID SvHandleDb(
     _Inout_ PVIRTUAL_PROCESSOR_DATA VpData)
 {
-    ULONG cpu = KeGetCurrentProcessorIndex();
-    SHADOW_STEP_STATE* s = &g_ShadowStep[cpu];
+    SHADOW_STEP_STATE* s = VpData->HostStackLayout.ShadowStepState;
+
+    constexpr UINT64 kTrapFlag = 1ULL << 8;
+    constexpr UINT64 kDr6Bd = 1ULL << 13;
+    constexpr UINT64 kDr6Bs = 1ULL << 14;
+    constexpr UINT64 kDr6Bt = 1ULL << 15;
+    constexpr UINT64 kDr6BreakpointMask = 0xFULL;
+    constexpr UINT64 kDr6GuestCauseMask =
+        kDr6BreakpointMask | kDr6Bd | kDr6Bt;
 
     const UINT64 dr6 = VpData->GuestVmcb.StateSaveArea.Dr6;
-    const bool   bs = (dr6 & (1ULL << 14)) != 0;  // single-step trap bit
-    const bool   hw = (dr6 & 0xF) != 0;           // DR0-DR3 hardware-BP match
+    const bool   bs = (dr6 & kDr6Bs) != 0;  // single-step trap bit
+    // Only treat hardware-BP bits as a coincident event when they are NEWLY set by
+    // this #DB — i.e., not already present in DR6 when the NPF armed our step.
+    // DR6 is sticky (processor ORs bits in, never auto-clears); without the mask
+    // stale bits from any prior event make hw=true every time, injecting a spurious
+    // STATUS_SINGLE_STEP #DB into non-debug kernel code (e.g. CLFS) → 0x3B bugcheck.
+    const UINT64 directGuestCauses = dr6 & kDr6GuestCauseMask;
+    const bool guestTfSet =
+        (VpData->GuestVmcb.StateSaveArea.Rflags & kTrapFlag) != 0;
+    const UINT64 newGuestCauses =
+        directGuestCauses & ~s->GuestDr6Snapshot;
+    const bool hw = (newGuestCauses & kDr6BreakpointMask) != 0;
+    const bool guestDebugCause = newGuestCauses != 0;
 
     // Ours only if this CPU has an active entry AND a single-step trap fired.
     const bool ours = (s->ActiveEntry != nullptr) && bs;
 
+    // Capture ActiveEntry before the abort path below nulls it — needed to
+    // distinguish "our abort" from "no pending step" at the inject decision.
+    const PSHADOW_PAGE_ENTRY savedActiveEntry = s->ActiveEntry;
+
     if (!ours)
     {
-        // Guest's own #DB (KD step, hw BP, ICEBP, etc.).
-        // DR6 is already correct in VMCB. Forward verbatim — do not touch TF.
-        InterlockedIncrement(&g_ShadowDbFwdCount);
-        SvShadowTrace(SHADOW_TRACE_KIND_FWD, 0, dr6, 0);
-        EVENTINJ ev;
-        ev.AsUInt64 = 0;
-        ev.Fields.Vector = 1;
-        ev.Fields.Type = 3;
-        ev.Fields.Valid = 1;
-        VpData->GuestVmcb.ControlArea.EventInj = ev.AsUInt64;
+        // If WE armed TF for a shadow step on this CPU (s->ActiveEntry != nullptr)
+        // but bs=false, a guest-owned debug event fired before the instruction
+        // completed. Abort the pending step, restore the decoy mapping, and remove
+        // only our TF contribution before returning the event to the guest.
+        if (s->ActiveEntry != nullptr)
+        {
+            PSHADOW_PAGE_ENTRY abandonEntry = s->ActiveEntry;
+            if (abandonEntry->NptPte)
+            {
+                PPT_ENTRY_4KB shadowPte = (PPT_ENTRY_4KB)(ULONG_PTR)abandonEntry->NptPte;
+                shadowPte->Fields.PageFrameNumber = abandonEntry->DecoyPA >> PAGE_SHIFT;
+                shadowPte->Fields.NoExecute = 1;
+                shadowPte->Fields.Write = 0;
+                abandonEntry->InExecState = FALSE;
+                SvRequestGuestTlbFlush(VpData);
+            }
+            // Restore the TF value that belonged to the guest.  Clearing it
+            // unconditionally breaks a guest debugger that was already stepping.
+            if (s->GuestHadTf)
+                VpData->GuestVmcb.StateSaveArea.Rflags |= kTrapFlag;
+            else
+                VpData->GuestVmcb.StateSaveArea.Rflags &= ~kTrapFlag;
+            s->ActiveEntry = nullptr;
+        }
+        // Two distinct sub-cases:
+        //
+        // A) s->ActiveEntry != nullptr (abort path above already cleaned up):
+        //    We armed TF, but a non-BS guest debug cause fired before the
+        //    instruction completed. Re-inject only when DR6 contains a newly
+        //    observed guest cause; this preserves debugger events without turning
+        //    stale sticky DR6 bits into a spurious STATUS_SINGLE_STEP.
+        //
+        // B) s->ActiveEntry == nullptr (no pending shadow step on this CPU):
+        //    We never armed TF.  The #DB is entirely organic — generated by
+        //    the guest itself (kernel debugger single-step, DR0-DR3 watchpoint,
+        //    or any other guest use of RFLAGS.TF / debug registers).  We MUST
+        //    re-inject it unconditionally to preserve architectural guest behavior.
+        const bool wasOurAbort = (savedActiveEntry != nullptr);
+        // A second #DB can be generated from EventInj after our first handler
+        // already cleared TF.  It has DR6.BS set, but no current TF and no
+        // independent B0-B3/BD/BT cause.  Forwarding that replay raises
+        // STATUS_SINGLE_STEP in arbitrary kernel code (the IOCTL dispatch entry
+        // in the observed crash).  Preserve real TF, hardware-breakpoint,
+        // task-switch, debug-register-access, and cause-less ICEBP events.
+        const bool staleBsReplay =
+            !wasOurAbort && bs && !guestTfSet && directGuestCauses == 0;
+
+        // When aborting our step, forward only a newly-observed guest cause.
+        // With no pending step, forward everything except the replay signature.
+        const bool shouldInject =
+            wasOurAbort ? guestDebugCause : !staleBsReplay;
+        if (shouldInject)
+        {
+            InterlockedIncrement(&g_ShadowDbFwdCount);
+            SvShadowTrace(SHADOW_TRACE_KIND_FWD, 0, dr6, 0);
+            EVENTINJ ev;
+            ev.AsUInt64 = 0;
+            ev.Fields.Vector = 1;
+            ev.Fields.Type = 3;
+            ev.Fields.Valid = 1;
+            VpData->GuestVmcb.ControlArea.EventInj = ev.AsUInt64;
+        }
+        else
+        {
+            // Cancel both possible copies of the consumed replay and remove its
+            // sticky BS indication before returning to the guest.
+            SvDiscardQueuedDb(VpData);
+            VpData->GuestVmcb.StateSaveArea.Dr6 &= ~kDr6Bs;
+        }
         return;
     }
 
-    // Our single-step: swap only this CPU's active entry back to decoy.
-    // Other CPUs' active entries are untouched.
     PSHADOW_PAGE_ENTRY e = s->ActiveEntry;
+
+    // The generated cave forwarder contains two instructions:
+    //   mov rax, target   (10 bytes)
+    //   jmp rax            (2 bytes)
+    // The first #DB lands at StubStart+10.  Keep the exec page and TF active
+    // for that second instruction; restoring the decoy here exposes the cave's
+    // original 0xCC padding instead of the jump and walks the debugger through
+    // one breakpoint byte after another.  Complete the swap only after RIP has
+    // left every registered stub range on this page.
+    if (!guestDebugCause &&
+        !s->GuestHadTf &&
+        SvRipIsInsideShadowStub(e, VpData->GuestVmcb.StateSaveArea.Rip))
+    {
+        if (!s->GuestHadBs)
+            VpData->GuestVmcb.StateSaveArea.Dr6 &= ~kDr6Bs;
+        SvDiscardQueuedDb(VpData);
+        SvShadowTrace(SHADOW_TRACE_KIND_CONT, e->GuestPA, dr6, 0);
+        return;
+    }
+
+    // Our completed single-step sequence: swap this active entry back to decoy.
     PPT_ENTRY_4KB pte = (PPT_ENTRY_4KB)(ULONG_PTR)e->NptPte;
     pte->Fields.PageFrameNumber = e->DecoyPA >> PAGE_SHIFT;
     pte->Fields.NoExecute = 1;
     pte->Fields.Write = 0;
     e->InExecState = FALSE;
-    VpData->GuestVmcb.ControlArea.TlbControl = 3;
+    SvRequestGuestTlbFlush(VpData);
 
     s->ActiveEntry = nullptr;
 
@@ -4148,15 +4372,23 @@ static VOID SvHandleDb(
 
     // Undo only what we contributed
     if (!s->GuestHadTf)
-        VpData->GuestVmcb.StateSaveArea.Rflags &= ~(UINT64)0x100;
+        VpData->GuestVmcb.StateSaveArea.Rflags &= ~kTrapFlag;
     if (!s->GuestHadBs)
-        VpData->GuestVmcb.StateSaveArea.Dr6 &= ~(UINT64)(1ULL << 14);
+        VpData->GuestVmcb.StateSaveArea.Dr6 &= ~kDr6Bs;
+
+    // The generic ExitIntInfo preservation runs before this handler.  If it
+    // queued the intercepted shadow-step #DB, consume that copy as well.  A
+    // genuine coincident guest event is re-created explicitly below.
+    SvDiscardQueuedDb(VpData);
 
     // If a hardware BP coincided with our step, or the guest had its own TF
     // active, forward a #DB so the guest's debugger still sees its event.
     // DR6 already reflects the residual cause(s) after our cleanup above.
     if (hw || s->GuestHadTf)
     {
+        InterlockedIncrement(&g_ShadowDbFwdCount);
+        SvShadowTrace(SHADOW_TRACE_KIND_FWD, e->GuestPA, dr6,
+            (UINT8)((hw ? 1 : 0) | (s->GuestHadTf ? 2 : 0)));
         EVENTINJ ev;
         ev.AsUInt64 = 0;
         ev.Fields.Vector = 1;
@@ -4448,15 +4680,19 @@ SvIsSvmSupported(
         goto Exit;
     }
 
+    g_SvmFlushByAsidSupported =
+        (registers[3] & CPUID_FN8000_000A_EDX_FLUSH_BY_ASID) != 0;
+
     // Report NRIP_SAVE (CPUID Fn8000_000A_EDX bit 3). Diagnostic only -
     // we do not fail if it is missing because SvAdvanceGuestRip falls
     // back to known instruction lengths. VMware's nested-SVM monitor
     // often clears this bit, or sets it but does not populate NRip
     // correctly, which is exactly the case where the explicit-length
     // fallback matters.
-    SvDebugPrint("[SvmSupport] SVM features EDX=%08X (NRIPS=%lu DecodeAssists=%lu)\n",
+    SvDebugPrint("[SvmSupport] SVM features EDX=%08X (NRIPS=%lu FlushByAsid=%lu DecodeAssists=%lu)\n",
         registers[3],
         (ULONG)((registers[3] >> 3) & 1u),    // NRIPS = bit 3
+        (ULONG)g_SvmFlushByAsidSupported,      // FlushByAsid = bit 6
         (ULONG)((registers[3] >> 7) & 1u));   // DecodeAssists = bit 7
 
     //
