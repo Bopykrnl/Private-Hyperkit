@@ -192,6 +192,7 @@ typedef struct _EVENTINJ
 static_assert(sizeof(EVENTINJ) == 8,
               "EVENTINJ Size Mismatch");
 
+
 //
 // See "SVM Intercept Codes"
 //
