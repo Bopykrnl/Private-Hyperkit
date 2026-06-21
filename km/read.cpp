@@ -198,32 +198,55 @@ namespace request
             return driver::status::failed_sanity_check;
         }
 
-        PEPROCESS process = 0;
-        if (!NT_SUCCESS(qtx_import(PsLookupProcessByProcessId)(
+        auto* output = reinterpret_cast<dtb_invoke*>(request->data);
+        output->dtb = 0;
+
+        if (data.pid == 0 || data.pid > MAXULONG) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                "SimpleSvm: GET_DTB rejected invalid PID 0x%llX\n",
+                static_cast<ULONG64>(data.pid));
+            return static_cast<driver::status>(STATUS_INVALID_PARAMETER);
+        }
+
+        PEPROCESS process = nullptr;
+        const NTSTATUS lookupStatus = qtx_import(PsLookupProcessByProcessId)(
             reinterpret_cast<HANDLE>(data.pid),
-            &process))) {
-            return driver::status::failed_sanity_check;
+            &process);
+        if (!NT_SUCCESS(lookupStatus) || process == nullptr) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                "SimpleSvm: GET_DTB PsLookupProcessByProcessId failed "
+                "PID=%llu status=0x%08X\n",
+                static_cast<ULONG64>(data.pid),
+                static_cast<ULONG>(lookupStatus));
+            return static_cast<driver::status>(lookupStatus);
         }
 
-        // Read DirectoryTableBase from physical EPROCESS memory.
-        // +0x28 = KPROCESS.DirectoryTableBase on x64 (shadow CR3 / real DTB).
-        // Using MmGetPhysicalAddress + MmGetVirtualForPhysical avoids any
-        // virtual-address access that AC could trap.
+        // DirectoryTableBase is at 0x28 in the native x64 EPROCESS layout.
+        // Do not fall back to a build-dependent field: returning unrelated
+        // EPROCESS data as a CR3 makes every later translation unsafe.
         uintptr_t process_dtb = 0;
-        {
-            PVOID dtbFieldVA = (PVOID)((ULONG_PTR)process + 0x28);
-            PHYSICAL_ADDRESS dtbFieldPA = MmGetPhysicalAddress(dtbFieldVA);
-            PVOID dtbFieldKVA = MmGetVirtualForPhysical(dtbFieldPA);
-            if (dtbFieldKVA)
-                process_dtb = *(uintptr_t*)dtbFieldKVA & ~(uintptr_t)0xFFF;
-        }
+        SIZE_T bytes = 0;
+        const NTSTATUS readStatus = read_virtual(
+            reinterpret_cast<uintptr_t>(process) + 0x28,
+            &process_dtb,
+            sizeof(process_dtb),
+            &bytes);
 
-        if (!process_dtb) {
+        if (!NT_SUCCESS(readStatus) ||
+            bytes != sizeof(process_dtb) ||
+            process_dtb == 0) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                "SimpleSvm: GET_DTB DirectoryTableBase read failed "
+                "PID=%llu status=0x%08X bytes=%llu dtb=0x%llX\n",
+                static_cast<ULONG64>(data.pid),
+                static_cast<ULONG>(readStatus),
+                static_cast<ULONG64>(bytes),
+                static_cast<ULONG64>(process_dtb));
             qtx_import(ObfDereferenceObject)(process);
             return driver::status::failed_sanity_check;
         }
 
-        reinterpret_cast<dtb_invoke*>(request->data)->dtb = process_dtb;
+        output->dtb = process_dtb;
 
         qtx_import(ObfDereferenceObject)(process);
         return driver::status::successful_operation;
@@ -253,10 +276,10 @@ namespace request
             return driver::status::failed_sanity_check;
         }
 
-        NTSTATUS  status    = STATUS_SUCCESS;
+        NTSTATUS  status = STATUS_SUCCESS;
         SIZE_T    remaining = data.size;
-        uintptr_t srcVA     = data.address;
-        uintptr_t dstVA     = (uintptr_t)data.buffer;
+        uintptr_t srcVA = data.address;
+        uintptr_t dstVA = (uintptr_t)data.buffer;
 
         while (remaining > 0)
         {
@@ -277,8 +300,8 @@ namespace request
                 break;
             }
 
-            srcVA     += chunk;
-            dstVA     += chunk;
+            srcVA += chunk;
+            dstVA += chunk;
             remaining -= chunk;
         }
 
